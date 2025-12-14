@@ -271,7 +271,14 @@ async def get_video_info(request: VideoInfoRequest):
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
-            'cookiefile': 'cookies.txt', # <-- Added Cookies Here
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web'],
+                }
+            },
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36',
+            }
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(request.url, download=False)
@@ -359,13 +366,20 @@ async def process_download(job_id: str, url: str, height: Optional[int], dl_type
         output_template = os.path.join(TEMP_DIR, f"{job_id}.%(ext)s")
         
         ydl_opts = {
-            'outtmpl': output_template,
-            'quiet': True,
-            'no_warnings': True,
-            'cookiefile': 'cookies.txt', # <-- Added Cookies Here
-            'progress_hooks': [lambda d: ydl_progress_hook(d, job_id)],
-            'postprocessor_hooks': [lambda d: ydl_postprocessor_hook(d, job_id)],
-        }
+                'outtmpl': output_template,
+                'quiet': True,
+                'no_warnings': True,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android', 'web'],
+                    }
+                },
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36',
+                },
+                'progress_hooks': [lambda d: ydl_progress_hook(d, job_id)],
+                'postprocessor_hooks': [lambda d: ydl_postprocessor_hook(d, job_id)],
+            }
 
         if dl_type == 'audio':
             ydl_opts.update({
