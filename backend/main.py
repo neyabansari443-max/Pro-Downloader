@@ -27,8 +27,101 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-TEMP_DIR = "temp_downloads"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMP_DIR = os.path.join(BASE_DIR, "temp_downloads")
 os.makedirs(TEMP_DIR, exist_ok=True)
+
+DEFAULT_COOKIES_PATH = os.path.join(BASE_DIR, "cookies.txt")
+
+
+def ensure_cookies_file_from_env() -> None:
+    """Materialize cookies.txt from environment variables (for Render).
+
+    Supported:
+      - YTDLP_COOKIES_B64: base64-encoded full Netscape cookies.txt content
+      - YTDLP_COOKIES_TEXT: raw Netscape cookies.txt content
+
+    If a non-empty cookies file already exists, this is a no-op.
+    """
+    cookies_b64 = (os.getenv("YTDLP_COOKIES_B64") or "").strip()
+    cookies_text = os.getenv("YTDLP_COOKIES_TEXT")
+
+    content: str | None = None
+    if cookies_b64:
+        try:
+            import base64
+
+            content = base64.b64decode(cookies_b64).decode("utf-8", errors="replace")
+        except Exception:
+            content = None
+    elif cookies_text:
+        content = cookies_text
+
+    if not content or not content.strip():
+        # No env cookies provided; keep any on-disk cookies as-is.
+        return
+
+    # Basic sanity: Netscape cookie files typically start with this header.
+    # If the user provides a different format, yt-dlp will error out later.
+    try:
+        os.makedirs(os.path.dirname(DEFAULT_COOKIES_PATH), exist_ok=True)
+        with open(DEFAULT_COOKIES_PATH, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+        print("✅ Cookies file created from env")
+    except Exception as e:
+        print(f"⚠️ Failed to write cookies file from env: {e}")
+
+
+def get_ytdlp_auth_opts() -> Dict[str, object]:
+    """Return yt-dlp auth options.
+
+    YouTube sometimes requires logged-in cookies ("confirm you're not a bot").
+    This supports either a cookie file (recommended for server) or reading
+    cookies from an installed browser (local dev only).
+
+    Env vars:
+      - YTDLP_COOKIES_FILE: path to Netscape cookies.txt
+      - YTDLP_COOKIES_FROM_BROWSER: e.g. 'chrome', 'firefox', 'edge', or 'chrome:Profile 2'
+    """
+    opts: Dict[str, object] = {}
+
+    cookies_from_browser = (os.getenv("YTDLP_COOKIES_FROM_BROWSER") or "").strip()
+    cookies_file = (os.getenv("YTDLP_COOKIES_FILE") or "").strip() or DEFAULT_COOKIES_PATH
+
+    if cookies_from_browser:
+        # yt-dlp expects a tuple: (browser,) or (browser, profile)
+        browser, sep, profile = cookies_from_browser.partition(":")
+        browser = browser.strip()
+        profile = profile.strip() if sep else ""
+        if browser:
+            opts["cookiesfrombrowser"] = (browser, profile) if profile else (browser,)
+        return opts
+
+    try:
+        if cookies_file and os.path.exists(cookies_file) and os.path.getsize(cookies_file) > 0:
+            opts["cookiefile"] = cookies_file
+    except Exception:
+        pass
+
+    return opts
+
+
+def humanize_yt_dlp_error(err: Exception) -> str:
+    text = str(err).replace("ERROR:", "").strip()
+    lowered = text.lower()
+
+    if (
+        "confirm you" in lowered
+        and "not a bot" in lowered
+    ) or "--cookies-from-browser" in lowered or "--cookies" in lowered:
+        return (
+            "YouTube is asking for verification. Provide logged-in cookies and try again. "
+            "Options: (1) export cookies to backend/cookies.txt (Netscape format), "
+            "or (2) set YTDLP_COOKIES_FROM_BROWSER=chrome (local dev)."
+        )
+
+    # Keep the old short message behavior as a fallback
+    return text.split(";")[0].strip()
 
 # Temp cleanup settings (safe defaults)
 TEMP_FILE_MAX_AGE_SECONDS = int(os.getenv("TEMP_FILE_MAX_AGE_SECONDS", "3600"))  # 1 hour
@@ -194,6 +287,9 @@ async def temp_cleanup_loop() -> None:
 # --- Startup Events ---
 @app.on_event("startup")
 async def startup_events() -> None:
+    # 0. If cookies are provided as Render secrets, write them to cookies.txt
+    ensure_cookies_file_from_env()
+
     # 1. Start Temp Cleaner
     asyncio.create_task(temp_cleanup_loop())
     
@@ -271,7 +367,7 @@ async def get_video_info(request: VideoInfoRequest):
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
-            'cookiefile': 'cookies.txt',
+            **get_ytdlp_auth_opts(),
             'extractor_args': {
                 'youtube': {
                     'player_client': ['ios'],
@@ -355,8 +451,7 @@ async def get_video_info(request: VideoInfoRequest):
                 "formats": formats_list
             }
     except Exception as e:
-        msg = str(e).replace('ERROR:', '').strip().split(';')[0]
-        raise HTTPException(status_code=400, detail=msg)
+        raise HTTPException(status_code=400, detail=humanize_yt_dlp_error(e))
 
 async def process_download(job_id: str, url: str, height: Optional[int], dl_type: str):
     # REMOVED SEMAPHORE: Ab yahan koi Lock nahi hai.
@@ -370,7 +465,7 @@ async def process_download(job_id: str, url: str, height: Optional[int], dl_type
                 'outtmpl': output_template,
                 'quiet': True,
                 'no_warnings': True,
-                'cookiefile': 'cookies.txt',
+                **get_ytdlp_auth_opts(),
                 'extractor_args': {
                     'youtube': {
                         'player_client': ['ios'],
@@ -429,7 +524,7 @@ async def process_download(job_id: str, url: str, height: Optional[int], dl_type
     except Exception as e:
         print(f"Job {job_id} failed: {e}")
         jobs[job_id]['status'] = 'failed'
-        jobs[job_id]['error'] = str(e)
+        jobs[job_id]['error'] = humanize_yt_dlp_error(e)
         for phase in jobs[job_id].get('phases', {}).values():
             if phase['status'] != 'completed':
                 phase['status'] = 'failed'

@@ -1,0 +1,6 @@
+# Netscape HTTP Cookie File
+# Export your YouTube cookies in Netscape format and paste them here.
+#
+# IMPORTANT:
+# - Do NOT commit real cookies to git.
+# - On Render, prefer setting YTDLP_COOKIES_B64 as a secret env var instead.
