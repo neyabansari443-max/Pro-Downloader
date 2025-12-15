@@ -5,7 +5,7 @@ import re
 import threading
 import time
 import urllib.request # Keep-alive ke liye
-from typing import Optional, Dict, Union
+from typing import Optional, Dict, Union, Any, cast
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -106,6 +106,40 @@ def get_ytdlp_auth_opts() -> Dict[str, object]:
     return opts
 
 
+def get_ytdlp_common_opts() -> Dict[str, object]:
+    """Common yt-dlp options used by both /info and /download.
+
+    Notes:
+    - Don't force a single YouTube player client by default; yt-dlp will pick
+      working clients automatically as YouTube changes.
+    - You can override player clients with YTDLP_YOUTUBE_PLAYER_CLIENTS.
+    """
+    opts: Dict[str, object] = {
+        "quiet": True,
+        "no_warnings": True,
+        **get_ytdlp_auth_opts(),
+    }
+
+    # Allow overriding UA to match the browser used to export cookies.
+    user_agent = (os.getenv("YTDLP_USER_AGENT") or "").strip()
+    if not user_agent:
+        user_agent = (
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36"
+        )
+    opts["http_headers"] = {"User-Agent": user_agent}
+
+    # Optional: override YouTube player clients (comma-separated)
+    # Example: YTDLP_YOUTUBE_PLAYER_CLIENTS=web,android,ios
+    clients_raw = (os.getenv("YTDLP_YOUTUBE_PLAYER_CLIENTS") or "").strip()
+    if clients_raw:
+        clients = [c.strip() for c in clients_raw.split(",") if c.strip()]
+        if clients:
+            opts["extractor_args"] = {"youtube": {"player_client": clients}}
+
+    return opts
+
+
 def humanize_yt_dlp_error(err: Exception) -> str:
     text = str(err).replace("ERROR:", "").strip()
     lowered = text.lower()
@@ -118,6 +152,19 @@ def humanize_yt_dlp_error(err: Exception) -> str:
             "YouTube is asking for verification. Provide logged-in cookies and try again. "
             "Options: (1) export cookies to backend/cookies.txt (Netscape format), "
             "or (2) set YTDLP_COOKIES_FROM_BROWSER=chrome (local dev)."
+        )
+
+    if "failed to extract any player response" in lowered:
+        return (
+            "YouTube extraction failed (no player response). This is usually caused by YouTube changes, "
+            "blocked IP/rate-limit, or stale cookies. Try: refresh cookies (incognito YouTube session), "
+            "redeploy to update yt-dlp, and if needed set YTDLP_YOUTUBE_PLAYER_CLIENTS=web,android,ios."
+        )
+
+    if "po token" in lowered:
+        return (
+            "YouTube may require a PO Token for this video/format. Try different player clients (e.g. web/android), "
+            "or follow yt-dlp's PO Token guidance. Cookies alone may not be sufficient in some cases."
         )
 
     # Keep the old short message behavior as a fallback
@@ -364,20 +411,8 @@ async def health_check():
 @app.post("/info")
 async def get_video_info(request: VideoInfoRequest):
     try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            **get_ytdlp_auth_opts(),
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['ios'],
-                }
-            },
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36',
-            }
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl_opts = get_ytdlp_common_opts()
+        with yt_dlp.YoutubeDL(cast(Any, ydl_opts)) as ydl:
             info = ydl.extract_info(request.url, download=False)
             
             formats_list = []
@@ -394,7 +429,7 @@ async def get_video_info(request: VideoInfoRequest):
                 })
             else:
                 seen_res = set()
-                available_formats = info.get('formats', [])
+                available_formats = cast(list, info.get('formats') or [])
                 available_formats.sort(key=lambda x: x.get('height') or 0, reverse=True)
 
                 def pick_progressive(height: int):
@@ -462,21 +497,11 @@ async def process_download(job_id: str, url: str, height: Optional[int], dl_type
         output_template = os.path.join(TEMP_DIR, f"{job_id}.%(ext)s")
         
         ydl_opts = {
-                'outtmpl': output_template,
-                'quiet': True,
-                'no_warnings': True,
-                **get_ytdlp_auth_opts(),
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['ios'],
-                    }
-                },
-                'http_headers': {
-                    'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36',
-                },
-                'progress_hooks': [lambda d: ydl_progress_hook(d, job_id)],
-                'postprocessor_hooks': [lambda d: ydl_postprocessor_hook(d, job_id)],
-            }
+            'outtmpl': output_template,
+            'progress_hooks': [lambda d: ydl_progress_hook(d, job_id)],
+            'postprocessor_hooks': [lambda d: ydl_postprocessor_hook(d, job_id)],
+            **get_ytdlp_common_opts(),
+        }
 
         if dl_type == 'audio':
             ydl_opts.update({
@@ -496,7 +521,7 @@ async def process_download(job_id: str, url: str, height: Optional[int], dl_type
         
         jobs[job_id]['status'] = 'downloading'
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(cast(Any, ydl_opts)) as ydl:
             info = ydl.extract_info(url, download=True)
             
             filename = None
